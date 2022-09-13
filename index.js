@@ -1,67 +1,134 @@
-// CloudWatch Custom Widget sample: simple debugger, displays form and parameters passed to widget
+// CloudWatch Custom Widget sample: display results of Athena queries
+const aws = require('aws-sdk')
+
+const CHECK_QUERY_STATUS_DELAY_MS = 250;
+const CSS = '<style>td { white-space: nowrap; }</style>'
+const ORIGINAL_QUERY = 'fields @timestamp, @message | parse @message "* *: *" as service, b, c |   filter service like ';
+
 const DOCS = `
-## Custom Widget Debugger
-A simpler "debugger" custom widget that prints out:
-* the Lambda **event** oject including the **widgetContext** parameter passed to the widget by CloudWatch Dashboards
-* the Lambda **context** object
-* the Lambda enivronment variables
+## Run Logs Insights Query
+Runs a Logs Insights query and displays results in a table.
 
 ### Widget parameters
-Just pass in any parameters you want to see how they are sent to the Lambda script.
+Param | Description
+---|---
+**logGroups** | The log groups (comma-separated) to run query against
+**query** | The query to run
+**region** | The region to run the query in
 
 ### Example parameters
 \`\`\` yaml
----
-param1: value
-param2:
-- entry1
-- entry2
-param3:
-  sub: 7
+logGroups: ${process.env.AWS_LAMBDA_LOG_GROUP_NAME}
+query: '${ORIGINAL_QUERY}'
+region: ${process.env.AWS_REGION}
 \`\`\`
 `;
+
+
+
+const runQuery = async (logsClient, logGroups, queryString, startTime, endTime) => {
+    const startQuery = await logsClient.startQuery({
+            logGroupNames: logGroups.replace(/\s/g, '').split(','),
+            queryString,
+            startTime,
+            endTime
+        }).promise();
+    const queryId = startQuery.queryId;
+
+    while (true) {
+        const queryResults = await logsClient.getQueryResults({ queryId }).promise();
+        if (queryResults.status !== 'Complete') {
+            await sleep(CHECK_QUERY_STATUS_DELAY_MS);     // Sleep before calling again
+        } else {
+            return queryResults.results;
+        }
+    }
+};
+
+const sleep = async (delay) => {
+    return new Promise((resolve) => setTimeout(resolve, delay));
+};
+
+let selectService="";
+
+const displayResults = async (logGroups, query, results, context ,event) => {
+
+    let html =  `
+        <form><table>
+            <tr>
+                <td>Log Groups</td><td><input name="logGroups" value="/aws/lambda/customWidgetLogsInsightsQuery-js" size="100"></td>
+            </tr>
+            <tr>
+            <td>
+              Select Service</td><td><select  name="selectService" value=${selectService}>
+                <option  value="END">END</option>
+                 <option  value="START">START</option>
+                </select>
+                </td>
+            </tr>
+            <tr>
+                <td valign=top>Query</td><td><textarea name="query" rows="2" cols="80">${ORIGINAL_QUERY}/${selectService}/</textarea></td>
+            </tr>
+        </table></form>
+        
+        <a class="btn btn-primary">Run query</a>
+         <cwdb-action action="call" endpoint="${context.invokedFunctionArn}" ></cwdb-action>
+        <a class="btn">Reset to original query</a>
+        <cwdb-action action="call" endpoint="${context.invokedFunctionArn}">
+            { "resetQuery": true }
+        </cwdb-action>
+        <p>
+        <h2>Results</h2>
+    `;
+    const stripPtr = result => result.filter(entry => entry.field !== '@ptr');
+
+    if (results && results.length > 0) {
+        const cols = stripPtr(results[0]).map(entry => entry.field);
+        
+        html += `<table><thead><tr><th>${cols.join('</th><th>')}</th></tr></thead><tbody>`;
+  
+        results.forEach(row => {
+            const vals = stripPtr(row).map(entry => entry.value);
+            html += `<tr><td>${vals.join('</td><td>')}</td></tr>`;
+        });
+  
+        html += `</tbody></table>`
+    } else {
+        html += `<pre>${JSON.stringify(results, null, 4)}</pre>`;
+    }
+    
+    return html;
+};
 
 exports.handler = async (event, context) => {
     if (event.describe) {
         return DOCS;   
     }
 
-    const form = event.widgetContext.forms.all;
-    const input = form.input || '';
-    const stage = form.stage || 'prod';
+    const widgetContext = event.widgetContext;
+    const form = widgetContext.forms.all;
+    const logGroups = form.logGroups || event.logGroups;
+    selectService = form.selectService || event.selectService;
+    const region = "us-east-1";
+    const timeRange = widgetContext.timeRange.zoom || widgetContext.timeRange;
+    const logsClient = new aws.CloudWatchLogs({ region });
+    const resetQuery = event.resetQuery;
+    
+    let query = form.query || event.query;
+    if (resetQuery) {
+        query = widgetContext.params.query || ORIGINAL_QUERY;
+    }
 
-    return `
-        <form>
-            <table>
-                <tr>
-                    <td>Input</td>
-                    <td><input name="input" value="${input}"></td>
-                    <td>Stage</td>
-                    <td><input type="radio" name="stage" id="integ" value="integ" ${stage === 'integ' ? 'checked' : ''}><label for="integ">Integ</label></td>
-                    <td><input type="radio" name="stage" id="prod" value="prod" ${stage === 'prod' ? 'checked' : ''}><label for="prod">Prod</label></td>
-                    <td>
-                        <a class="btn">Popup</a>
-                        <cwdb-action action="html" display="popup">
-                            <h1>Form values:</h1>
-                            <table>
-                                <tr><td>Input:</td><td><b>${input}</b></td></tr>
-                                <tr><td>Stage:</td><td><b>${stage}</b></td></tr>
-                            </table>
-                        </cwdb-action>
-                    </td>
-                    <td>
-                        <a class="btn btn-primary">Submit</a>
-                        <cwdb-action action="call" endpoint="${context.invokedFunctionArn}"></cwdb-action>
-                    </td>
-                </tr>
-            </table>
-        </form>
-        <p>
-        <h1>event</h1>
-        <pre>${JSON.stringify(event, null, 4)}</pre>
-        <h1>context</h1>
-        <pre>${JSON.stringify(context, null, 4)}</pre>
-        <h1>environment variables</h1>
-        <pre>${JSON.stringify(process.env, null, 4)}</pre>
-    `;
+    let results;
+
+    if (query && query.trim() !== '') {
+        try {
+            results = await runQuery(logsClient, logGroups, query, timeRange.start, timeRange.end);
+        } catch (e) {
+            results = e;
+        }
+    }
+
+    return CSS + await displayResults(logGroups, query, results, context,event);
 };
+
